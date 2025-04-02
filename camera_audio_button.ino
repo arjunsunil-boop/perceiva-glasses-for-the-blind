@@ -35,8 +35,8 @@ const char* ssid = "Galaxy S23 F2B0";
 const char* password = "appikund";
 
 // Server configuration
-const char* serverAudioURL = "http://192.168.94.1:8888/uploadAudio";
-const char* serverImageURL = "http://192.168.94.1:8888/uploadImage";
+const char* serverAudioURL = "http://192.168.202.1:8888/uploadAudio";
+const char* serverImageURL = "http://192.168.202.1:8888/uploadImage";
 
 void setup() {
   Serial.begin(115200);
@@ -130,7 +130,7 @@ void sendModeToServer(int currentMode) {
   }
 
   HTTPClient http;
-  String serverModeURL = "http://192.168.94.1:8888/uploadMode"; // Adjust URL as needed
+  String serverModeURL = "http://192.168.202.1:8888/uploadMode"; // Adjust URL as needed
   http.begin(serverModeURL);
   http.addHeader("Content-Type", "text/plain");
 

@@ -14,6 +14,7 @@ import re
 from gtts import gTTS
 import subprocess
 from io import BytesIO
+import time
 
 app = Flask(__name__)
 
@@ -34,9 +35,6 @@ CLIENT = InferenceHTTPClient(
 
 # Database API configuration
 DATABASE_API_URL = "http://127.0.0.1:5000/get_item_position"
-
-# Class labels for products - updated with all possible classes
-
 
 # Global mode variable
 current_mode = 0
@@ -98,9 +96,13 @@ def send_to_database(item_name):
         return False
     
 def clear_upload_folder():
-    """Clears all files in the upload folder"""
+    """Clears all files in the upload folder except for cropped_object_ files"""
     try:
         for filename in os.listdir(UPLOAD_FOLDER):
+            # Skip cropped object files
+            if filename.startswith('cropped_object_'):
+                continue
+                
             file_path = os.path.join(UPLOAD_FOLDER, filename)
             try:
                 if os.path.isfile(file_path) or os.path.islink(file_path):
@@ -109,7 +111,7 @@ def clear_upload_folder():
                     shutil.rmtree(file_path)
             except Exception as e:
                 print(f'Failed to delete {file_path}. Reason: {e}')
-        print("Upload folder cleared successfully")
+        print("Upload folder cleared (keeping cropped objects)")
         return True
     except Exception as e:
         print(f"Error clearing upload folder: {str(e)}")
@@ -118,6 +120,7 @@ def clear_upload_folder():
 def get_top_prediction(image_path):
     """Get the top prediction from YOLO model with confidence"""
     try:
+        print(f"Classifying image: {image_path}")
         results = CLASSIFICATION_MODEL(image_path)
         
         if not results or len(results) == 0:
@@ -190,6 +193,15 @@ def process_currency(image_path):
 def process_image_with_model(image_path):
     """Process image through detection model and save cropped objects"""
     try:
+        # Clear previous cropped objects
+        for filename in os.listdir(UPLOAD_FOLDER):
+            if filename.startswith('cropped_object_'):
+                file_path = os.path.join(UPLOAD_FOLDER, filename)
+                try:
+                    os.unlink(file_path)
+                except Exception as e:
+                    print(f'Failed to delete old crop {file_path}. Reason: {e}')
+        
         result = CLIENT.infer(image_path, model_id="sku-110k/2")
         image = Image.open(image_path)
         detections = result.get("predictions", [])
@@ -233,13 +245,15 @@ def transcribe_audio(audio_path):
 @app.route('/uploadImage', methods=['POST'])
 def upload_image():
     try:
+        # Clear non-cropped files but keep cropped objects
         clear_upload_folder()
+        
         file_data = request.data
         
         if not file_data:
             return jsonify({"error": "No file data received"}), 400
 
-        filename = f"image_.jpg"
+        filename = f"image_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
         filepath = os.path.join(UPLOAD_FOLDER, filename)
         
         try:
@@ -255,14 +269,37 @@ def upload_image():
         
         if current_mode == 0:
             print("Processing image through product detection model...")
+            # Process the image and crop objects
             cropped_images = process_image_with_model(filepath)
+            
             if not cropped_images:
                 return jsonify({"warning": "Image saved but processing failed"}), 200
+            
+            # Make sure all cropped images are saved
+            time.sleep(1)
+            
+            # Verify the cropped images exist
+            verified_cropped = []
+            for img_path in cropped_images:
+                if os.path.exists(img_path) and os.path.getsize(img_path) > 0:
+                    verified_cropped.append(img_path)
+                else:
+                    print(f"Warning: Cropped image not found at {img_path}")
+            
+            if not verified_cropped:
+                return jsonify({"error": "No valid cropped images found"}), 500
+            
+            # Try to load classifier with first image to make sure it's ready
+            try:
+                get_top_prediction(verified_cropped[0])
+                print("Classification model tested successfully")
+            except Exception as e:
+                print(f"Warning: Classification model test failed: {str(e)}")
             
             return jsonify({
                 "message": "Image uploaded successfully (product mode)",
                 "filename": filename,
-                "cropped_images": cropped_images
+                "cropped_images": verified_cropped
             }), 200
         else:
             print("Processing image through currency detection model...")
@@ -291,7 +328,7 @@ def upload_audio():
         if not file_data:
             return jsonify({"error": "No file data received"}), 400
             
-        filename = f"audio_.wav"
+        filename = f"audio_{datetime.now().strftime('%Y%m%d_%H%M%S')}.wav"
         filepath = os.path.join(UPLOAD_FOLDER, filename)
         
         with open(filepath, 'wb') as f:
@@ -306,32 +343,56 @@ def upload_audio():
             os.remove("error.mp3")
             return jsonify({"error": "Transcription failed"}), 400
         
-        cropped_images = [os.path.join(UPLOAD_FOLDER, f) for f in os.listdir(UPLOAD_FOLDER) 
-                         if f.startswith('cropped_object_') and f.endswith('.jpg')]
+        # Get all cropped images that exist
+        cropped_images = []
+        for f in os.listdir(UPLOAD_FOLDER):
+            if f.startswith('cropped_object_') and f.endswith('.jpg'):
+                img_path = os.path.join(UPLOAD_FOLDER, f)
+                if os.path.exists(img_path) and os.path.getsize(img_path) > 0:
+                    cropped_images.append(img_path)
+        
+        if not cropped_images:
+            print("NO CROPPED IMAGES FOUND")
+            tts = gTTS(text="No products detected in the image", lang='en')
+            tts.save("no_products.mp3")
+            play_audio("no_products.mp3")
+            os.remove("no_products.mp3")
+            return jsonify({"message": "NO PRODUCTS DETECTED"}), 200
+        
+        # Process all cropped images
+        best_match = None
+        highest_confidence = 0
+        
+        print(f"Checking {len(cropped_images)} cropped images against transcription: '{transcription}'")
         
         for img_path in cropped_images:
             prediction = get_top_prediction(img_path)
             if not prediction:
+                print(f"No prediction for {img_path}")
                 continue
                 
             print(f"Checking if '{prediction['clean_class']}' matches '{transcription}'")
             
-            # More flexible matching - check if either:
-            # 1. The class name is in the transcription, or
-            # 2. The transcription is in the class name
+            # More flexible matching
             if (prediction['clean_class'] in transcription or 
                 transcription in prediction['clean_class']):
                 
-                print(f"MATCH FOUND: {prediction['class']}")
-                send_to_database(prediction['class'])
-                return jsonify({
-                    "message": "PRODUCT IDENTIFIED",
-                    "product": prediction['class'],
-                    "confidence": prediction['confidence']
-                }), 200
+                if prediction['confidence'] > highest_confidence:
+                    highest_confidence = prediction['confidence']
+                    best_match = prediction['class']
+                    print(f"Found match: {best_match} (Confidence: {highest_confidence:.2f})")
+        
+        if best_match:
+            print(f"BEST MATCH FOUND: {best_match} (Confidence: {highest_confidence:.2f})")
+            send_to_database(best_match)
+            return jsonify({
+                "message": "PRODUCT IDENTIFIED",
+                "product": best_match,
+                "confidence": highest_confidence
+            }), 200
         
         print("NO PRODUCT MATCH FOUND")
-        tts = gTTS(text="  No product match found", lang='en')
+        tts = gTTS(text="No matching product found", lang='en')
         tts.save("no_match.mp3")
         play_audio("no_match.mp3")
         os.remove("no_match.mp3")
@@ -340,11 +401,14 @@ def upload_audio():
         
     except Exception as e:
         print(f"Audio upload error: {str(e)}")
-        tts = gTTS(text="An error occurred while processing", lang='en')
-        tts.save("error.mp3")
-        play_audio("error.mp3")
-        os.remove("error.mp3")
-        return jsonify({"error": str(e)}), 500
+        try:
+            tts = gTTS(text="An error occurred while processing", lang='en')
+            tts.save("error.mp3")
+            play_audio("error.mp3")
+            os.remove("error.mp3")
+        except Exception as audio_error:
+            print(f"Failed to play error audio: {str(audio_error)}")
+        return jsonify({"error": str(e)}), 500  
     
 @app.route('/uploadMode', methods=['POST'])
 def upload_mode():
